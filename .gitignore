@@ -354,3 +354,5 @@ config.local.py
 !.vscode/settings.json
 !.vscode/extensions.json
 
+# Google Cloud Credentials
+backend/app/google/
