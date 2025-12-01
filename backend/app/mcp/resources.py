@@ -155,3 +155,7 @@ def parse_time_of_day_filter(time_of_day: str):
     if t == "evening":
         return (16, 19)
     return (9, 17)
+
+def ensure_google_folder():
+    if not os.path.exists(GOOGLE_DIR):
+        os.makedirs(GOOGLE_DIR, exist_ok=True)

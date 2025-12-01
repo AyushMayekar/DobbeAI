@@ -2,6 +2,7 @@
 from app.db import SessionLocal
 from app.models import Doctor
 from app.mcp import tools
+from app import ai
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -70,3 +71,19 @@ def call_tool(payload: ToolCall):
         raise HTTPException(status_code=400, detail="Unknown tool")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# AI API endpoints
+class AIRequest(BaseModel):
+    session_id: Optional[str] = None
+    message: str
+
+@app.post("/api/ai")
+def api_ai(payload: AIRequest):
+    if not payload.message or payload.message.strip() == "":
+        raise HTTPException(status_code=400, detail="message required")
+    result = ai.process_user_message(payload.session_id, payload.message)
+    return result
+
+@app.get("/api/session/{session_id}")
+def get_session(session_id: str):
+    return ai.dump_session(session_id)
