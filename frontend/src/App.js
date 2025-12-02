@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { sendMessage, getSession, requestDoctorReportApi } from "./api";
+import { sendMessage, getSession, requestDoctorReportApi, loginApi } from "./api";
 import "./index.css";
 
 function uid() {
@@ -14,19 +14,24 @@ function Message({ m }) {
         <span className="role">{m.role}</span>
         <span className="time">{new Date(m.time * 1000).toLocaleTimeString()}</span>
       </div>
-      <div className="msg-content">{m.content.split("\n").map((t,i)=>(<p key={i}>{t}</p>))}</div>
+      <div className="msg-content">{m.content.split("\n").map((t, i) => (<p key={i}>{t}</p>))}</div>
     </div>
   );
 }
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
-  const [messages, setMessages] = useState([]); 
+  const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [role, setRole] = useState("patient"); 
+  const [role, setRole] = useState(localStorage.getItem("mcp_role") || "patient");
   const [toolCalls, setToolCalls] = useState([]);
   const bottomRef = useRef();
+  const [token, setToken] = useState(localStorage.getItem("mcp_token") || null);
+  const [email, setEmail] = useState("");
+  const [loginRole, setLoginRole] = useState("patient"); // default
+  const [doctorName, setDoctorName] = useState(localStorage.getItem("mcp_doctor_name") || null);
+
 
   useEffect(() => {
     let sid = localStorage.getItem("mcp_session_id");
@@ -44,7 +49,6 @@ export default function App() {
           setMessages(mapped);
         }
       } catch (e) {
-        // ignore
       }
     })();
   }, []);
@@ -71,7 +75,7 @@ export default function App() {
       }
     } catch (err) {
       console.error(err);
-      const errorMsg = { role: "assistant", content: "Error: failed to reach backend.", time: Math.floor(Date.now()/1000) };
+      const errorMsg = { role: "assistant", content: "Error: failed to reach backend.", time: Math.floor(Date.now() / 1000) };
       setMessages(m => [...m, errorMsg]);
     } finally {
       setLoading(false);
@@ -90,7 +94,7 @@ export default function App() {
     if (!sessionId) return;
     setLoading(true);
     try {
-      const res = await requestDoctorReportApi("Dr. Ahuja", null, true);
+      const res = await requestDoctorReportApi(null, null, true);
       if (res && res.summary_text) {
         const assistantMsg = {
           role: "assistant",
@@ -99,16 +103,64 @@ export default function App() {
         };
         setMessages(m => [...m, assistantMsg]);
       } else {
-        const assistantMsg = { role: "assistant", content: "No summary returned.", time: Math.floor(Date.now()/1000) };
+        const assistantMsg = { role: "assistant", content: "No summary returned.", time: Math.floor(Date.now() / 1000) };
         setMessages(m => [...m, assistantMsg]);
       }
     } catch (err) {
-      const msg = { role: "assistant", content: "Failed to fetch report.", time: Math.floor(Date.now()/1000) };
+      const msg = { role: "assistant", content: "Failed to fetch report.", time: Math.floor(Date.now() / 1000) };
       setMessages(m => [...m, msg]);
     } finally {
       setLoading(false);
     }
-  }
+  }  
+
+  function logout() {
+    localStorage.removeItem("mcp_token");
+    localStorage.removeItem("mcp_role");
+    localStorage.removeItem("mcp_doctor_name");
+    setToken(null);
+    setDoctorName(null);
+    setMessages([]);
+    setRole("patient");
+  }  
+
+  if (!token) {
+    return (
+      <div className="container" style={{padding:20}}>
+        <h2>Login (demo)</h2>
+        <p>Use a predefined doctor email for doctor role (e.g. mehta@clinic.com)</p>
+        <div style={{maxWidth:420}}>
+          <label>Email</label>
+          <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@domain.com" />
+          <label>Role</label>
+          <select value={loginRole} onChange={e=>setLoginRole(e.target.value)}>
+            <option value="patient">Patient</option>
+            <option value="doctor">Doctor</option>
+          </select>
+          <div style={{marginTop:10}}>
+            <button onClick={async ()=>{
+              setLoading(true);
+              try {
+                const data = await loginApi(email, loginRole);
+                localStorage.setItem("mcp_token", data.token);
+                localStorage.setItem("mcp_role", data.role);
+                setRole(data.role);
+                if (data.doctor_name) {
+                  localStorage.setItem("mcp_doctor_name", data.doctor_name);
+                  setDoctorName(data.doctor_name);
+                }
+                setToken(data.token);
+              } catch (err) {
+                alert("Login failed: " + (err.response?.data?.detail || err.message));
+              } finally {
+                setLoading(false);
+              }
+            }} disabled={loading || !email}>Continue</button>
+          </div>
+        </div>
+      </div>
+    );
+  }  
 
   return (
     <div className="container">
@@ -116,7 +168,7 @@ export default function App() {
         <h1>Agentic Healthcare Assistant</h1>
         <div className="controls">
           <label className="role-toggle">
-            <select value={role} onChange={e=>setRole(e.target.value)}>
+            <select value={role} onChange={e => setRole(e.target.value)} disabled={!!token}>
               <option value="patient">Patient</option>
               <option value="doctor">Doctor</option>
             </select>

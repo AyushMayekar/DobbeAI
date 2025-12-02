@@ -14,8 +14,25 @@ import os, requests
 
 SLOT_MINUTES = 60  # use 60-minute appointment slots for simplicity
 
+def _normalize_doc_name(name: str) -> str:
+    if not name:
+        return ""
+    name = name.strip().lower()
+    if not name.startswith("dr"):
+        return f"dr. {name}"
+    return name.replace("  ", " ").replace("dr ", "dr. ").strip()
+
+
 def _get_doctor_by_name(db, doctor_name: str):
-    return db.query(Doctor).filter(Doctor.name.ilike(f"%{doctor_name}%")).first()
+    if not doctor_name:
+        return None
+
+    target = _normalize_doc_name(doctor_name)
+
+    # exact match only
+    doc = db.query(Doctor).filter(func.lower(Doctor.name) == target).first()
+
+    return doc
 
 def _existing_slots_for_date(db, doctor_id: int, target_date: date) -> List[time]:
     rows = db.query(Appointment).filter(

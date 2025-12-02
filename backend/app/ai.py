@@ -113,8 +113,9 @@ def build_tools_schema():
     ]
 
 
-# Call the MCP tool functions
-def call_tool_by_name(name: str, args: dict):
+# Call the MCP tool functions, with optional role-based access control
+def call_tool_by_name(name: str, args: dict, token_info: Optional[dict] = None):
+    role = (token_info or {}).get("role")
     try:
         if name == "get_doctor_availability":
             return mcp_tools.get_doctor_availability(
@@ -133,6 +134,8 @@ def call_tool_by_name(name: str, args: dict):
                 reason=args.get("reason"),
             )
         if name == "get_doctor_summary_report":
+            if role != "doctor":
+                return {"ok": False, "error": "forbidden: get_doctor_summary_report is restricted to doctors"}
             return mcp_tools.get_doctor_summary_report(
                 doctor_name=args.get("doctor_name"),
                 ref_date_str=args.get("ref_date"),
@@ -215,8 +218,9 @@ def summarize_tool_outputs(tool_outputs: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) if lines else "No results."
 
 
-def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
+def mock_agent_reply(session_id: str, message: str, token_info: Optional[dict] = None) -> Dict[str, Any]:
     msg = message.lower()
+    role = (token_info or {}).get("role")
     tool_calls = []
     reply = "I didn't understand. Try: 'check Dr. Ahuja availability', 'book 2025-12-02T09:00 for John', or 'how many patients yesterday'."
 
@@ -257,13 +261,17 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
         elif "today" in msg:
             ref_date = today.isoformat()
 
+        if role != "doctor":
+            reply = "Only doctors can view detailed appointment reports. Please contact your doctor for this information."
+        else:
             res = call_tool_by_name(
                 "get_doctor_summary_report",
                 {
                     "doctor_name": doctor_name,
                     "ref_date": ref_date,
                     "send_notification": True
-                }
+                },
+                token_info=token_info,
             )
             tool_calls.append({
                 "tool": "get_doctor_summary_report",
@@ -312,9 +320,6 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
             else:
                 reply = f"Error: {res.get('error')}"
 
-        else:
-            reply = f"Error: {res.get('error')}"
-
     # booking intent
     elif "book" in msg or "schedule" in msg:
         dt_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})", message)
@@ -359,17 +364,71 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
 
 
 # OpenAI agent flow 
-def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
+def openai_agent_reply(session_id: str, user_message: str, token_info: Optional[dict] = None):
     if not openai_client:
         return {"reply": "OpenAI client not initialized; falling back to mock.", "tool_calls": []}
 
     history = get_session_history(session_id)
 
-    messages = [{"role": "system", "content":
-                    "You are an assistant for a medical appointment system. "
-                    "You may call tools to check availability, create appointments, or fetch stats. "
-                    "When you call a tool, use the tools API (tool_calls). After tool output is provided, produce a short, human-friendly summary for the user. "
-                    "Use ISO datetimes for start_iso/end_iso."}]
+    system_prompt = (
+    "You are an AI assistant for a medical appointment scheduling system. "
+    "Your job is to help users check doctor availability, create appointments, "
+    "and retrieve system statistics using tool calls. You must follow strict rules "
+    "to ensure accuracy and safe operation.\n\n"
+
+    "AVAILABLE DOCTORS:\n"
+    "- Dr. Ahuja\n"
+    "- Dr. Mehta\n"
+    "- Dr. Sharma\n"
+    "- Dr. Roy\n"
+    "- Dr. Joy\n"
+    "- Dr. Joshi\n\n"
+
+    "CORE RULES:\n"
+    "1. Never guess or invent doctor names.\n"
+    "2. Only use EXACT doctor names from the provided list.\n"
+    "3. If the user does not mention a doctor name, ask: 'Which doctor would you like?'\n"
+    "4. If the user mentions a doctor not in the list, reply: "
+    "'I don’t recognize that doctor. Available doctors are: Dr. Ahuja, Dr. Mehta, "
+    "Dr. Sharma, Dr. Roy, Dr. Joy, Dr. Joshi.'\n"
+    "5. Do NOT assume a default doctor.\n"
+    "6. Do NOT choose a doctor unless explicitly told by the user.\n"
+    "7. All date/time values in tool calls MUST be ISO-8601 format (YYYY-MM-DDTHH:MM:SS).\n"
+    "8. You may call tools ONLY through the tool_calls API.\n"
+    "9. If a tool is required, always call it BEFORE giving a final answer.\n"
+    "10. After receiving tool output, ALWAYS generate a short, friendly, human-readable summary.\n"
+    "11. Never reveal internal JSON, tool arguments, call IDs, or raw system messages.\n"
+    "12. If information is missing (doctor, date, time), ask follow-up questions before making a tool call.\n"
+    "13. If the user asks for system stats, call the stats tool.\n"
+    "14. If a tool error occurs, explain it in simple language.\n"
+    "15. Keep responses concise, helpful, and on-topic.\n"
+    "16. Redirect politely if the user asks for non-medical/irrelevant queries.\n\n"
+
+    "TOOL USAGE LOGIC:\n"
+    "- Ask for missing details BEFORE calling tools.\n"
+    "- For checking doctor availability → call the availability tool.\n"
+    "- For creating appointments → call the appointment creation tool ONLY when "
+    "all required details are known.\n"
+    "- For system analytics → call the stats tool.\n\n"
+
+    "CONVERSATION RULES:\n"
+    "• Maintain context from earlier messages.\n"
+    "• If the user changes doctor or datetime, reconfirm before booking.\n"
+    "• Never contradict previous context unless the user corrects it.\n\n"
+
+    "OUTPUT RULES:\n"
+    "- User-facing messages must be natural and human.\n"
+    "- Tool calls MUST match the exact schema.\n"
+    "- Never fabricate tool responses.\n"
+    "- The final message after tool execution should be a clean summary.\n"
+)
+
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
+
+    if token_info and token_info.get("role") == "doctor" and token_info.get("doctor_name"):
+        messages.append({"role": "system", "content": f"You are acting on behalf of {token_info['doctor_name']}. Use this identity when appropriate."})
 
     # Append only user/assistant history
     for item in history:
@@ -379,6 +438,12 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
     messages.append({"role": "user", "content": user_message})
 
     tools = build_tools_schema()
+    role = (token_info or {}).get("role")
+    if role != "doctor":
+        tools = [
+            t for t in tools
+            if not (t.get("function", {}).get("name") == "get_doctor_summary_report")
+        ]
 
     try:
         resp = openai_client.chat.completions.create(
@@ -405,7 +470,7 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
                 args = json.loads(raw_args)
             except:
                 args = {}
-            result = call_tool_by_name(tool_name, args)
+            result = call_tool_by_name(tool_name, args, token_info=token_info)
             tool_outputs.append({"tool": tool_name, "args": args, "result": result})
 
             # Append the tool output back to the LLM conversation in the required format
@@ -439,20 +504,26 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
     return {"reply": assistant_text, "tool_calls": []}
 
 
-def process_user_message(session_id: Optional[str], message: str) -> Dict[str, Any]:
+def process_user_message(session_id: Optional[str], message: str, token_info: Optional[dict] = None) -> Dict[str, Any]:
     if not session_id:
         session_id = create_session()
     append_session(session_id, "user", message)
 
     if USE_OPENAI and openai_client:
-        out = openai_agent_reply(session_id, message)
+        out = openai_agent_reply(session_id, message, token_info=token_info)
         mode = "openai"
     else:
-        out = mock_agent_reply(session_id, message)
+        out = mock_agent_reply(session_id, message, token_info=token_info) if 'mock_agent_reply' in globals() else mock_agent_reply(session_id, message)
         mode = "mock"
 
     append_session(session_id, "assistant", out.get("reply", ""))
-    return {"ok": True, "session_id": session_id, "reply": out.get("reply"), "tool_calls": out.get("tool_calls", []), "mode": mode}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "reply": out.get("reply"),
+        "tool_calls": out.get("tool_calls", []),
+        "mode": mode
+    }
 
 # Debug helper
 def dump_session(session_id: str) -> Dict[str, Any]:
