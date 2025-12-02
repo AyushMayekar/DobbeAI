@@ -1,5 +1,5 @@
 from .db import Base, engine
-from . import models  # noqa: F401
+from . import models 
 
 def init():
     Base.metadata.create_all(bind=engine)
