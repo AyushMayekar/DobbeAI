@@ -16,7 +16,6 @@ if USE_OPENAI:
         from openai import OpenAI
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
     except Exception as e:
-        # If something goes wrong, fallback to mock
         print("OpenAI client init failed:", e)
         openai_client = None
         USE_OPENAI = False
@@ -51,7 +50,6 @@ def get_session_history(session_id: str) -> List[Dict[str, Any]]:
     return sessions.get(session_id, [])
 
 
-# Tool schema builder (for new OpenAI tools API)
 def build_tools_schema():
     return [
         {
@@ -97,20 +95,21 @@ def build_tools_schema():
             },
         },
         {
-            "type": "function",
-            "function": {
-                "name": "get_doctor_stats",
-                "description": "Return patient counts and fever cases.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "doctor_name": {"type": "string"},
-                        "ref_date": {"type": "string"},
-                    },
-                    "required": ["doctor_name"],
-                },
-            },
+    "type": "function",
+    "function": {
+    "name": "get_doctor_summary_report",
+    "description": "Return a summary report of patient counts and reasons, and optionally notify the doctor through Slack.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+        "doctor_name": { "type": "string", "description": "Doctor full name, e.g. 'Dr. Ahuja'." },
+        "ref_date": { "type": "string", "description": "Reference date in YYYY-MM-DD format (optional). If omitted, defaults to today." },
+        "send_notification": { "type": "boolean", "description": "If true, send the summary to the doctor's Slack webhook (if configured)." }
         },
+        "required": ["doctor_name"]
+    }
+    }
+}
     ]
 
 
@@ -133,17 +132,17 @@ def call_tool_by_name(name: str, args: dict):
                 end_iso=args.get("end_iso"),
                 reason=args.get("reason"),
             )
-        if name == "get_doctor_stats":
-            return mcp_tools.get_doctor_stats(
+        if name == "get_doctor_summary_report":
+            return mcp_tools.get_doctor_summary_report(
                 doctor_name=args.get("doctor_name"),
                 ref_date_str=args.get("ref_date"),
+                send_notification=args.get("send_notification", True)
             )
         return {"ok": False, "error": f"Unknown tool '{name}'"}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-# Deterministic human-friendly summarizer (fallback)
 def summarize_tool_outputs(tool_outputs: List[Dict[str, Any]]) -> str:
     """
     Create readable text from tool outputs if the model fails to produce a good summary.
@@ -167,22 +166,55 @@ def summarize_tool_outputs(tool_outputs: List[Dict[str, Any]]) -> str:
                 lines.append(f"Appointment created (id: {appt_id}). {cal_note}")
             else:
                 lines.append(f"Failed to create appointment: {res.get('error')}")
-        elif tool == "get_doctor_stats":
+        elif tool == "get_doctor_summary_report":
             if res.get("ok"):
-                lines.append(
-                    f"{res.get('doctor')} — Yesterday: {res.get('patients_yesterday')}, "
-                    f"Today: {res.get('patients_today')}, Tomorrow: {res.get('patients_tomorrow')}, "
-                    f"Fever cases: {res.get('fever_cases')}"
-                )
+                summary_text = res.get("summary_text")
+                if summary_text and isinstance(summary_text, str) and summary_text.strip():
+                    lines.append(summary_text)
+                    notified = res.get("notification_sent", False)
+                    lines.append("")
+                    lines.append(f"Notification sent: {'Yes' if notified else 'No'}")
+                else:
+                    # Build summary from raw_stats
+                    raw = res.get("raw_stats", {})
+                    doc = raw.get("doctor", "Doctor")
+                    ref = raw.get("ref_date", "")
+                    y = raw.get("patients_yesterday", 0)
+                    t = raw.get("patients_today", 0)
+                    tm = raw.get("patients_tomorrow", 0)
+
+                    # top_reasons preferred
+                    top = raw.get("top_reasons") or []
+                    if top:
+                        parts = [f"• {r['reason'].title()}: {r['count']}" for r in top[:10]]
+                    else:
+                        rb = raw.get("reasons_breakdown", {})
+                        parts = [f"• {k.title()}: {v}" for k, v in sorted(rb.items(), key=lambda x: -x[1])][:10]
+
+                    lines.append(f"Summary report for {doc} — {ref}")
+                    lines.append("")
+                    lines.append(f"- Patients yesterday: {y}")
+                    lines.append("")
+                    lines.append(f"- Patients today: {t}")
+                    lines.append("")
+                    lines.append(f"- Patients tomorrow: {tm}")
+                    lines.append("")
+                    lines.append("- Reason breakdown:")
+                    lines.append("")
+                    if parts:
+                        lines.extend(parts)
+                    else:
+                        lines.append("• No categorized reasons available.")
+                    notified = res.get("notification_sent", False)
+                    lines.append("")
+                    lines.append(f"Notification sent: {'Yes' if notified else 'No'}")
             else:
                 lines.append(f"Stats error: {res.get('error')}")
         else:
-            # generic fallback
             lines.append(json.dumps(res))
     return "\n".join(lines) if lines else "No results."
 
 
-# Simple rule-based mock agent (safe defaults)
 def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
     msg = message.lower()
     tool_calls = []
@@ -192,7 +224,6 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
     m = re.search(r"dr\.?\s+([a-zA-Z]+)", message, re.IGNORECASE)
     doctor_name = "Dr. Ahuja" if not m else f"Dr. {m.group(1).title()}"
 
-    # date handling — default to today (unless user says tomorrow/yesterday)
     today = datetime.utcnow().date()
     if "tomorrow" in msg:
         start_date = (today + timedelta(days=1)).isoformat()
@@ -226,18 +257,66 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
         elif "today" in msg:
             ref_date = today.isoformat()
 
-        res = call_tool_by_name("get_doctor_stats", {"doctor_name": doctor_name, "ref_date": ref_date})
-        tool_calls.append({"tool": "get_doctor_stats", "args": {"doctor_name": doctor_name, "ref_date": ref_date}, "result": res})
-        if res.get("ok"):
-            reply = (f"Stats for {res.get('doctor')} — patients yesterday: {res.get('patients_yesterday')}, "
-                        f"today: {res.get('patients_today')}, tomorrow: {res.get('patients_tomorrow')}, "
-                        f"fever cases: {res.get('fever_cases')}")
+            res = call_tool_by_name(
+                "get_doctor_summary_report",
+                {
+                    "doctor_name": doctor_name,
+                    "ref_date": ref_date,
+                    "send_notification": True
+                }
+            )
+            tool_calls.append({
+                "tool": "get_doctor_summary_report",
+                "args": {"doctor_name": doctor_name, "ref_date": ref_date, "send_notification": True},
+                "result": res
+            })
+
+            if res.get("ok"):
+                summary = res.get("summary_text")
+                if summary and isinstance(summary, str) and summary.strip():
+                    notified = res.get("notification_sent", False)
+                    reply = f"{summary}\n\nNotification sent: {'Yes' if notified else 'No'}"
+                else:
+                    raw = res.get("raw_stats", {})
+                    doc = raw.get("doctor", doctor_name)
+                    ref = raw.get("ref_date", ref_date or "")
+                    y = raw.get("patients_yesterday", 0)
+                    t = raw.get("patients_today", 0)
+                    tm = raw.get("patients_tomorrow", 0)
+
+                    top = raw.get("top_reasons") or []
+                    if top:
+                        parts = [f"• {r['reason'].title()}: {r['count']}" for r in top[:10]]
+                    else:
+                        rb = raw.get("reasons_breakdown", {})
+                        parts = [f"• {k.title()}: {v}" for k, v in sorted(rb.items(), key=lambda x: -x[1])][:10]
+
+                    lines = [
+                        f"Summary report for {doc} — {ref}",
+                        "",
+                        f"- Patients yesterday: {y}",
+                        "",
+                        f"- Patients today: {t}",
+                        "",
+                        f"- Patients tomorrow: {tm}",
+                        "",
+                        "- Reason breakdown:",
+                        ""
+                    ]
+                    lines.extend(parts if parts else ["• No categorized reasons available."])
+                    notified = res.get("notification_sent", False)
+                    lines.append("")
+                    lines.append(f"Notification sent: {'Yes' if notified else 'No'}")
+
+                    reply = "\n".join(lines)
+            else:
+                reply = f"Error: {res.get('error')}"
+
         else:
             reply = f"Error: {res.get('error')}"
 
     # booking intent
     elif "book" in msg or "schedule" in msg:
-        # look for ISO-like datetime
         dt_match = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})", message)
         name_match = re.search(r"dr\.?\s+([a-zA-Z]+)", message, re.IGNORECASE)
         patient_match = re.search(r"for\s+([A-Za-z ]+)", message, re.IGNORECASE)
@@ -279,14 +358,13 @@ def mock_agent_reply(session_id: str, message: str) -> Dict[str, Any]:
     return {"reply": reply, "tool_calls": tool_calls}
 
 
-# OpenAI agent flow (modern tools API)
+# OpenAI agent flow 
 def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
     if not openai_client:
         return {"reply": "OpenAI client not initialized; falling back to mock.", "tool_calls": []}
 
     history = get_session_history(session_id)
 
-    # Build base messages without any 'tool' roles initially
     messages = [{"role": "system", "content":
                     "You are an assistant for a medical appointment system. "
                     "You may call tools to check availability, create appointments, or fetch stats. "
@@ -302,7 +380,6 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
 
     tools = build_tools_schema()
 
-    # First call: let model decide whether to call a tool
     try:
         resp = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
@@ -338,7 +415,6 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
                 "content": json.dumps(result)
             })
 
-        # Now ask the model to summarize the tool outputs in human-friendly text
         try:
             final_resp = openai_client.chat.completions.create(
                 model="gpt-4.1-mini",
@@ -350,7 +426,6 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
         except Exception as e:
             final_text = None
 
-        # If model did not produce a friendly text, use deterministic summarizer
         if not final_text or final_text.strip() == "" or final_text.strip().lower().startswith("tool result"):
             final_text = summarize_tool_outputs(tool_outputs)
 
@@ -364,7 +439,6 @@ def openai_agent_reply(session_id: str, user_message: str) -> Dict[str, Any]:
     return {"reply": assistant_text, "tool_calls": []}
 
 
-# Public entry: process user message
 def process_user_message(session_id: Optional[str], message: str) -> Dict[str, Any]:
     if not session_id:
         session_id = create_session()
@@ -379,7 +453,6 @@ def process_user_message(session_id: Optional[str], message: str) -> Dict[str, A
 
     append_session(session_id, "assistant", out.get("reply", ""))
     return {"ok": True, "session_id": session_id, "reply": out.get("reply"), "tool_calls": out.get("tool_calls", []), "mode": mode}
-
 
 # Debug helper
 def dump_session(session_id: str) -> Dict[str, Any]:

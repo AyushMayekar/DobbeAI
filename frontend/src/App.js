@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { sendMessage, getSession } from "./api";
+import { sendMessage, getSession, requestDoctorReportApi } from "./api";
 import "./index.css";
 
 function uid() {
@@ -21,31 +21,27 @@ function Message({ m }) {
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
-  const [messages, setMessages] = useState([]); // {role,content,time}
+  const [messages, setMessages] = useState([]); 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [role, setRole] = useState("patient"); // patient | doctor
+  const [role, setRole] = useState("patient"); 
   const [toolCalls, setToolCalls] = useState([]);
   const bottomRef = useRef();
 
   useEffect(() => {
-    // load or create session id
     let sid = localStorage.getItem("mcp_session_id");
     if (!sid) {
       sid = uid();
       localStorage.setItem("mcp_session_id", sid);
     }
     setSessionId(sid);
-    // optional: fetch session history from backend (debug)
+
     (async () => {
       try {
         const data = await getSession(sid);
         if (data && data.history) {
-          // convert history to our messages format
-          setMessages((prev) => {
-            const mapped = data.history.map(h => ({ role: h.role, content: h.content, time: h.time }));
-            return mapped;
-          });
+          const mapped = data.history.map(h => ({ role: h.role, content: h.content, time: h.time }));
+          setMessages(mapped);
         }
       } catch (e) {
         // ignore
@@ -89,16 +85,35 @@ export default function App() {
     }
   }
 
-  function quickDoctorStats() {
-    // simple natural-language prompt for doctor stats
-    const q = "How many patients did I have yesterday?";
-    handleSend(q);
+  // Doctor: request summary & notify
+  async function requestDoctorReport() {
+    if (!sessionId) return;
+    setLoading(true);
+    try {
+      const res = await requestDoctorReportApi("Dr. Ahuja", null, true);
+      if (res && res.summary_text) {
+        const assistantMsg = {
+          role: "assistant",
+          content: res.summary_text + "\n\nNotification sent: " + (res.notification_sent ? "Yes" : "No"),
+          time: Math.floor(Date.now() / 1000)
+        };
+        setMessages(m => [...m, assistantMsg]);
+      } else {
+        const assistantMsg = { role: "assistant", content: "No summary returned.", time: Math.floor(Date.now()/1000) };
+        setMessages(m => [...m, assistantMsg]);
+      }
+    } catch (err) {
+      const msg = { role: "assistant", content: "Failed to fetch report.", time: Math.floor(Date.now()/1000) };
+      setMessages(m => [...m, msg]);
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <div className="container">
       <header className="topbar">
-        <h1>Agentic MCP — App</h1>
+        <h1>Agentic Healthcare Assistant</h1>
         <div className="controls">
           <label className="role-toggle">
             <select value={role} onChange={e=>setRole(e.target.value)}>
@@ -106,7 +121,10 @@ export default function App() {
               <option value="doctor">Doctor</option>
             </select>
           </label>
-          <button className="dash-btn" onClick={quickDoctorStats}>Doctor: Get Yesterday's Stats</button>
+
+          {role === "doctor" && (
+            <button disabled={loading} onClick={requestDoctorReport}>Send Summary & Notify</button>
+          )}
         </div>
       </header>
 
@@ -132,36 +150,18 @@ export default function App() {
           </div>
         </section>
 
-        <aside className="sidebar">
-          <div className="card">
-            <h3>Session</h3>
-            <p><strong>session_id:</strong></p>
-            <code className="sid">{sessionId}</code>
-            <p><strong>mode:</strong> {loading ? "waiting..." : "idle"}</p>
-          </div>
-
-          <div className="card">
-            <h3>Tool Calls (debug)</h3>
-            {toolCalls && toolCalls.length ? (
-              toolCalls.map((t, i) => (
-                <details key={i} className="tool">
-                  <summary>{t.tool} — {t.result && t.result.ok ? "ok":"err"}</summary>
-                  <pre>{JSON.stringify(t, null, 2)}</pre>
-                </details>
-              ))
-            ) : <p>No tool calls yet.</p>}
-          </div>
-
-          <div className="card">
-            <h3>Shortcuts</h3>
-            <button onClick={()=>handleSend("Check Dr. Ahuja availability today morning")}>Check Dr. Ahuja (today)</button>
-            <button onClick={()=>handleSend("I want to book an appointment with Dr. Ahuja tomorrow morning")}>Book (start flow)</button>
-          </div>
-        </aside>
+        {role === "doctor" && (
+          <aside className="sidebar">
+            <div className="card">
+              <h3>Doctor Dashboard</h3>
+              <p>Use "Send Summary & Notify" to push today's summary to your notification channel.</p>
+            </div>
+          </aside>
+        )}
       </main>
 
       <footer className="footer">
-        <small>Agentic MCP demo — React client</small>
+        <small>Agentic Healthcare Assistant</small>
       </footer>
     </div>
   );

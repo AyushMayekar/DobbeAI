@@ -1,10 +1,4 @@
-# backend/app/init_db.py
-"""
-Create DB tables from models. Run:
-python -m app.init_db
-"""
 from .db import Base, engine
-# import models so SQLAlchemy knows about them
 from . import models  # noqa: F401
 
 def init():

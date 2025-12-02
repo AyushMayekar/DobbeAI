@@ -12,3 +12,9 @@ export async function getSession(session_id) {
     const res = await axios.get(`${API_BASE}/api/session/${session_id}`);
     return res.data;
 }
+
+export async function requestDoctorReportApi(doctor_name = "Dr. Ahuja", ref_date = null, send_notification = true) {
+    const payload = { doctor_name, ref_date, send_notification };
+    const res = await axios.post(`${API_BASE}/doctor/report`, payload, { timeout: 20000 });
+    return res.data;
+}

@@ -1,8 +1,3 @@
-# backend/app/seed.py
-"""
-Seed initial data (Dr. Ahuja). Run:
-python -m app.seed
-"""
 from app.db import SessionLocal
 from app.models import Doctor
 

@@ -1,12 +1,8 @@
-# File: backend/app/mcp/tools.py
-"""
-MCP tools: DB-driven functions the LLM can call.
-Keep outputs simple JSON-serializable.
-"""
 from datetime import datetime, date, time, timedelta
 from typing import List, Dict
 from app.db import SessionLocal
 from app.models import Doctor, Appointment
+from sqlalchemy import func
 from .resources import (
     daterange,
     parse_time_of_day_filter,
@@ -14,6 +10,7 @@ from .resources import (
     send_email_stub,
     time_to_iso,
 )
+import os, requests
 
 SLOT_MINUTES = 60  # use 60-minute appointment slots for simplicity
 
@@ -111,11 +108,7 @@ def create_appointment(doctor_name: str, patient_name: str, patient_email: str, 
     finally:
         db.close()
 
-def get_doctor_stats(doctor_name: str, ref_date_str: str = None) -> Dict:
-    """
-    Return counts: yesterday, today, tomorrow, and 'fever' keyword count.
-    ref_date_str defaults to today (YYYY-MM-DD).
-    """
+def get_doctor_stats(doctor_name: str, ref_date_str: str = None) -> dict:
     db = SessionLocal()
     try:
         doc = _get_doctor_by_name(db, doctor_name)
@@ -131,28 +124,103 @@ def get_doctor_stats(doctor_name: str, ref_date_str: str = None) -> Dict:
         tomorrow = ref_date + timedelta(days=1)
 
         def count_on(target_date):
-            return db.query(Appointment).filter(
+            return db.query(func.count(Appointment.id)).filter(
                 Appointment.doctor_id == doc.id,
                 Appointment.date == target_date
-            ).count()
+            ).scalar() or 0
 
         count_yesterday = count_on(yesterday)
         count_today = count_on(ref_date)
         count_tomorrow = count_on(tomorrow)
 
-        # fever cases: simple keyword match in reason
-        fever_cases = db.query(Appointment).filter(
+        rows = db.query(Appointment.reason).filter(
             Appointment.doctor_id == doc.id,
-            Appointment.reason.ilike("%fever%")
-        ).count()
+            Appointment.date == ref_date
+        ).all()
+
+        # aggregate reasons with normalization
+        breakdown = {}
+        for (reason,) in rows:  
+            key = _normalize_reason(reason)
+            breakdown[key] = breakdown.get(key, 0) + 1
+
+        # sort top reasons
+        top_reasons = sorted(breakdown.items(), key=lambda x: x[1], reverse=True)
 
         return {
             "ok": True,
             "doctor": doc.name,
+            "ref_date": ref_date.isoformat(),
             "patients_yesterday": count_yesterday,
             "patients_today": count_today,
             "patients_tomorrow": count_tomorrow,
-            "fever_cases": fever_cases
+            "reasons_breakdown": breakdown,
+            "top_reasons": [{"reason": r, "count": c} for r, c in top_reasons]
         }
     finally:
         db.close()
+
+def _normalize_reason(reason: str) -> str:
+    if not reason:
+        return "other"
+    r = reason.lower().strip()
+    if any(k in r for k in ("fever", "temperature", "hot")):
+        return "fever"
+    if any(k in r for k in ("check", "checkup", "routine", "follow-up", "follow up", "consult")):
+        return "checkup"
+    if any(k in r for k in ("cough", "cold", "flu", "sore", "throat")):
+        return "respiratory"
+    if any(k in r for k in ("pain", "ache", "injury", "back", "headache", "head ache")):
+        return "pain"
+    if any(k in r for k in ("prescription", "med", "refill")):
+        return "prescription"
+    token = r.split()[0][:20]
+    return token or "other"
+
+# Slack helper (simple webhook)
+def _send_slack_message(text: str) -> dict:
+    webhook = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook:
+        return {"ok": False, "error": "no_slack_webhook"}
+    payload = {"text": text}
+    try:
+        resp = requests.post(webhook, json=payload, timeout=5)
+        return {"ok": resp.status_code in (200, 201, 204), "status_code": resp.status_code, "text": resp.text}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def get_doctor_summary_report(doctor_name: str, ref_date_str: str = None, send_notification: bool = True) -> dict:
+    """
+    Returns a human-friendly summary and optionally sends Slack notification.
+    """
+    stats = get_doctor_stats(doctor_name, ref_date_str)
+    if not stats.get("ok"):
+        return {"ok": False, "error": stats.get("error")}
+
+    lines = []
+    lines.append(f"Summary report for {stats['doctor']} — {stats['ref_date']}")
+    lines.append(f"- Patients yesterday: {stats['patients_yesterday']}")
+    lines.append(f"- Patients today: {stats['patients_today']}")
+    lines.append(f"- Patients tomorrow: {stats['patients_tomorrow']}")
+    lines.append("- Reason breakdown:")
+    if stats.get("top_reasons"):
+        for tr in stats["top_reasons"]:
+            lines.append(f"  • {tr['reason'].title()}: {tr['count']}")
+    else:
+        lines.append("  • No categorized reasons for this date.")
+
+    summary_text = "\n".join(lines)
+
+    notification_result = None
+    if send_notification:
+        notification_result = _send_slack_message(summary_text)
+
+    return {
+        "ok": True,
+        "doctor": stats["doctor"],
+        "ref_date": stats["ref_date"],
+        "summary_text": summary_text,
+        "notification_sent": bool(notification_result and notification_result.get("ok")),
+        "notification_result": notification_result,
+        "raw_stats": stats,
+    }
